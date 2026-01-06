@@ -13,9 +13,11 @@ This orchestrator:
 """
 
 import os
+import sys
 import json
 import asyncio
-import structlog
+import logging
+import tomllib
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 
@@ -26,7 +28,27 @@ from src.models import CaseContext, WarrantyStatus, Location
 from src.compute.service import ComputeService
 
 
-logger = structlog.get_logger(__name__)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
+logger = logging.getLogger(__name__)
+
+
+def load_config() -> dict:
+    """Load configuration from config/agent.toml."""
+    config_path = "config/agent.toml"
+    try:
+        with open(config_path, "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        logger.warning(f"Config file not found at {config_path}")
+        return {}
+    except Exception as e:
+        logger.warning(f"Error loading config: {e}")
+        return {}
 
 
 # Workflow step types
@@ -63,7 +85,7 @@ class WarrantyOrchestrator:
         self,
         endpoint: str = None,
         deployment: str = None,
-        api_version: str = "2024-10-01-preview"
+        api_version: str = "2024-12-01-preview"
     ):
         """
         Initialize the warranty orchestrator.
@@ -73,9 +95,14 @@ class WarrantyOrchestrator:
             deployment: Model deployment name
             api_version: API version
         """
-        self.endpoint = endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT", "")
-        self.deployment = deployment or os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-        self.api_version = api_version
+        # Load config from file
+        config = load_config()
+        azure_config = config.get("agent", {}).get("azure_openai", {})
+        
+        # Priority: constructor args > config file > environment variables
+        self.endpoint = endpoint or azure_config.get("endpoint") or os.environ.get("AZURE_OPENAI_ENDPOINT", "")
+        self.deployment = deployment or azure_config.get("deployment") or os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+        self.api_version = azure_config.get("api_version", api_version)
         
         # Initialize compute service (local tool)
         self.compute_service = ComputeService()
@@ -89,11 +116,7 @@ class WarrantyOrchestrator:
         # Load system prompt
         self.system_prompt = self._load_system_prompt()
         
-        logger.info(
-            "Warranty Orchestrator initialized",
-            endpoint=self.endpoint,
-            deployment=self.deployment
-        )
+        logger.info(f"Warranty Orchestrator initialized - endpoint={self.endpoint}, deployment={self.deployment}")
     
     def _init_client(self):
         """Initialize the Azure OpenAI client."""
@@ -155,7 +178,7 @@ class WarrantyOrchestrator:
             case.add_user_message(request["user_message"])
         
         self._cases[case.case_id] = case
-        logger.info("Created new case", case_id=case.case_id)
+        logger.info(f"Created new case - case_id={case.case_id}")
         
         return case
     
@@ -187,11 +210,7 @@ class WarrantyOrchestrator:
             case = self.get_or_create_case(request)
             user_message = request.get("user_message", "")
             
-            logger.info(
-                "Processing request",
-                case_id=case.case_id,
-                user_message=user_message[:100]
-            )
+            logger.info(f"Processing request - case_id={case.case_id}, user_message={user_message[:100]}")
             
             # Generate and execute plan
             result = await self._execute_workflow(case, user_message)
@@ -206,7 +225,7 @@ class WarrantyOrchestrator:
             }
             
         except Exception as e:
-            logger.error("Request processing failed", error=str(e), exc_info=True)
+            logger.error(f"Request processing failed - error={str(e)}", exc_info=True)
             return {
                 "case_id": request.get("case_id", "unknown"),
                 "status": "error",
@@ -242,7 +261,7 @@ class WarrantyOrchestrator:
         try:
             self._validate_plan(plan, case)
         except PlanValidationError as e:
-            logger.error("Plan validation failed", error=str(e))
+            logger.error(f"Plan validation failed - error={str(e)}")
             return {
                 "response": "I need to verify some information. " + str(e),
                 "action": None
@@ -410,7 +429,7 @@ class WarrantyOrchestrator:
         
         Routes to the appropriate MCP server or local tool.
         """
-        logger.info("Executing tool", tool_name=tool_name, args=tool_args)
+        logger.info(f"Executing tool - tool_name={tool_name}, args={tool_args}")
         
         try:
             # Import MCP server functions for POC (direct call)
@@ -488,7 +507,7 @@ class WarrantyOrchestrator:
                 }
                 
         except Exception as e:
-            logger.error(f"Tool execution failed: {tool_name}", error=str(e))
+            logger.error(f"Tool execution failed: {tool_name} - error={str(e)}")
             return {
                 "status": "error",
                 "error_code": "TOOL_ERROR",
@@ -599,7 +618,7 @@ Based on the workflow constraints, determine the appropriate next steps.
                 }
                 
         except Exception as e:
-            logger.error("LLM processing failed", error=str(e))
+            logger.error(f"LLM processing failed - error={str(e)}")
             # Fallback to rule-based
             return await self._execute_workflow(case, user_message)
     
