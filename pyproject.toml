@@ -1,0 +1,110 @@
+[project]
+name = "warranty-poc"
+version = "0.1.0"
+description = "Warranty Orchestrator POC using Microsoft Agent Framework with MCP support"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Scientialibera" }
+]
+keywords = ["ai", "agent", "azure-openai", "microsoft", "framework", "warranty", "mcp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "azure-identity>=1.15.0",
+    "azure-core>=1.24.0",
+    "openai>=1.0.0",
+    "agent-framework>=0.1.0",
+    "structlog>=23.1.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "tenacity>=8.2.0",
+    "anyio>=4.0.0",
+    "typing-extensions>=4.0.0",
+    "tomli>=2.0.0;python_version<'3.11'",
+    "mcp>=1.0.0",
+    "python-dateutil>=2.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "config*"]
+
+# ==============================================================================
+# AGENT CONFIGURATION
+# ==============================================================================
+
+[tool.agent]
+system_prompt = "config/system_prompt.txt"
+log_level = "INFO"
+
+[tool.agent.azure_openai]
+endpoint = ""
+deployment = ""
+api_version = "2024-10-01-preview"
+
+[tool.agent.tools]
+config_dir = "config/tools"
+
+# ==============================================================================
+# MCP SERVER CONFIGURATION
+# ==============================================================================
+
+[[tool.agent.mcp]]
+name = "planner"
+type = "stdio"
+enabled = true
+command = "python"
+args = ["-m", "src.mcp_servers.planner"]
+
+[[tool.agent.mcp]]
+name = "warranty_docs"
+type = "stdio"
+enabled = true
+command = "python"
+args = ["-m", "src.mcp_servers.warranty_docs"]
+
+[[tool.agent.mcp]]
+name = "actions"
+type = "stdio"
+enabled = true
+command = "python"
+args = ["-m", "src.mcp_servers.actions"]
+
+# ==============================================================================
+# DEVELOPMENT TOOLS
+# ==============================================================================
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
