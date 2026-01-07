@@ -187,47 +187,94 @@ class WarrantyOrchestrator:
         Process an incoming warranty request.
         
         This is the main entry point for the orchestrator.
+        Supports OpenAI-style API format where caller manages message history.
         
         Args:
-            request: Request from Copilot Studio containing:
-                - user_message: The user's message
-                - logged_in: Boolean login status
-                - has_registered_products: Boolean registration status
-                - product_id: Optional product ID
-                - location: Optional location object
-                - case_id: Optional case ID for continuing a case
+            request: Request following OpenAI API format containing:
+                - messages: Array of message objects with role/content
+                    [{"role": "user", "content": "..."},
+                     {"role": "assistant", "content": "..."},
+                     {"role": "user", "content": "..."}]
+                - context: Optional context object containing:
+                    - logged_in: Boolean login status
+                    - has_registered_products: Boolean registration status
+                    - product_id: Optional product ID
+                    - location: Optional location object
+                    - case_id: Optional case ID for continuing a case
+                    - customer_id, customer_name, etc.
                 
         Returns:
-            Response dict with:
+            Response dict following OpenAI-style format:
                 - case_id: The case identifier
-                - response: Message to display to user
+                - message: Response object {"role": "assistant", "content": "..."}
                 - action: Optional action for Copilot Studio to take
                 - action_data: Optional data for the action
                 - status: "ok" or "error"
+                - tool_calls: List of tool call summaries for debugging
         """
         try:
-            # Get or create case context
-            case = self.get_or_create_case(request)
-            user_message = request.get("user_message", "")
+            # Extract messages and context from OpenAI-style request
+            messages = request.get("messages", [])
+            context = request.get("context", {})
             
-            logger.info(f"Processing request - case_id={case.case_id}, user_message={user_message[:100]}")
+            # Get the latest user message
+            user_message = ""
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    user_message = msg.get("content", "")
+                    break
+            
+            # Build internal request from context
+            internal_request = {
+                "user_message": user_message,
+                "logged_in": context.get("logged_in", False),
+                "has_registered_products": context.get("has_registered_products", False),
+                "product_id": context.get("product_id"),
+                "product_type": context.get("product_type"),
+                "product_name": context.get("product_name"),
+                "serial_number": context.get("serial_number"),
+                "purchase_date": context.get("purchase_date"),
+                "warranty_status": context.get("warranty_status"),
+                "location": context.get("location"),
+                "customer_id": context.get("customer_id"),
+                "customer_name": context.get("customer_name"),
+                "case_id": context.get("case_id"),
+                "channel": context.get("channel", "chat")
+            }
+            
+            # Get or create case context
+            case = self.get_or_create_case(internal_request)
+            
+            logger.info("=" * 70)
+            logger.info(f"PROCESS REQUEST - case_id={case.case_id}")
+            logger.info(f"User Message: {user_message[:200]}...")
+            logger.info(f"Messages in history: {len(messages)}")
+            logger.info("=" * 70)
             
             # Use LLM for reasoning (falls back to rule-based if client unavailable)
-            result = await self.process_with_llm(case, user_message)
+            result = await self.process_with_llm(case, user_message, messages)
             
             # Save case state
             self._cases[case.case_id] = case
             
+            # Return in OpenAI-style format
             return {
                 "case_id": case.case_id,
                 "status": "ok",
-                **result
+                "message": {
+                    "role": "assistant",
+                    "content": result.get("response", "")
+                },
+                "response": result.get("response", ""),  # Keep for backward compatibility
+                "action": result.get("action"),
+                "action_data": result.get("action_data"),
+                "tool_calls": result.get("tool_calls", [])
             }
             
         except Exception as e:
             logger.error(f"Request processing failed - error={str(e)}", exc_info=True)
             return {
-                "case_id": request.get("case_id", "unknown"),
+                "case_id": request.get("context", {}).get("case_id", "unknown"),
                 "status": "error",
                 "response": f"I apologize, but I encountered an error processing your request. Please try again.",
                 "error": str(e)
@@ -592,7 +639,8 @@ class WarrantyOrchestrator:
     async def process_with_llm(
         self,
         case: CaseContext,
-        user_message: str
+        user_message: str,
+        conversation_history: List[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Process request using Azure OpenAI with tool calling.
@@ -604,12 +652,20 @@ class WarrantyOrchestrator:
         1. Send message to LLM
         2. If LLM wants to call tools, execute them and send results back
         3. Repeat until LLM gives a final response (no more tool calls)
+        
+        Args:
+            case: Current case context
+            user_message: The user's latest message
+            conversation_history: Optional list of previous messages in OpenAI format
         """
         if not self.client:
             logger.warning("No Azure OpenAI client available - falling back to rule-based processing")
             return await self._execute_workflow(case, user_message)
         
-        logger.info(">>> Starting LLM agentic loop...")
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info(">>> STARTING LLM AGENTIC LOOP")
+        logger.info("=" * 70)
         
         # Get current date for calculations
         from datetime import date
@@ -622,7 +678,7 @@ class WarrantyOrchestrator:
             warranty_expiry = getattr(case.warranty_status, 'expiration_date', None)
             coverage_limits = getattr(case.warranty_status, 'all_coverage', {})
         
-        # Build initial messages
+        # Build initial messages with system prompt
         messages = [
             {"role": "system", "content": self.system_prompt + """
 
@@ -640,8 +696,18 @@ CRITICAL - USE CODE INTERPRETER FOR ALL MATH:
 - Example: To find warranty days remaining, use run_calculation with Python code
 - Example: To find how much customer must pay if warranty covers $X but cost is $Y, use run_calculation
 - Always show the customer the calculation results clearly
-"""},
-            {"role": "user", "content": f"""
+"""}
+        ]
+        
+        # Add conversation history if provided (excluding system messages)
+        if conversation_history:
+            for msg in conversation_history:
+                if msg.get("role") != "system":
+                    messages.append({"role": msg["role"], "content": msg.get("content", "")})
+            logger.info(f"Added {len(conversation_history)} messages from conversation history")
+        
+        # Always append current context as the latest user message
+        context_message = f"""
 === CURRENT DATE ===
 Today's Date: {current_date}
 
@@ -668,15 +734,20 @@ Today's Date: {current_date}
 {user_message}
 
 REMINDER: Use run_calculation tool for ANY math (days remaining, cost gaps, etc.)
-"""}
-        ]
+"""
+        messages.append({"role": "user", "content": context_message})
         
         max_iterations = 10  # Prevent infinite loops
-        all_tool_results = []
+        all_tool_calls = []  # Track all tool calls for logging
         
         for iteration in range(max_iterations):
             try:
-                logger.info(f">>> LLM iteration {iteration + 1}: Sending request to {self.deployment}...")
+                logger.info("")
+                logger.info("-" * 50)
+                logger.info(f">>> LLM ITERATION {iteration + 1}")
+                logger.info(f"    Model: {self.deployment}")
+                logger.info(f"    Messages in context: {len(messages)}")
+                logger.info("-" * 50)
                 
                 response = self.client.chat.completions.create(
                     model=self.deployment,
@@ -689,7 +760,11 @@ REMINDER: Use run_calculation tool for ANY math (days remaining, cost gaps, etc.
                 message = response.choices[0].message
                 finish_reason = response.choices[0].finish_reason
                 
-                logger.info(f"<<< LLM response - finish_reason={finish_reason}, has_tool_calls={bool(message.tool_calls)}")
+                logger.info(f"<<< LLM Response:")
+                logger.info(f"    Finish Reason: {finish_reason}")
+                logger.info(f"    Tool Calls: {len(message.tool_calls) if message.tool_calls else 0}")
+                if message.content:
+                    logger.info(f"    Content Preview: {message.content[:150]}...")
                 
                 # If LLM wants to call tools
                 if message.tool_calls:
@@ -717,13 +792,68 @@ REMINDER: Use run_calculation tool for ANY math (days remaining, cost gaps, etc.
                         except json.JSONDecodeError:
                             tool_args = {}
                         
-                        logger.info(f"    Executing tool: {tool_name} with args: {json.dumps(tool_args, default=str)[:200]}")
+                        logger.info("")
+                        logger.info(f"    ┌─── TOOL CALL: {tool_name} ───")
+                        logger.info(f"    │ Arguments: {json.dumps(tool_args, default=str, indent=2)[:500]}")
                         
                         # Execute the tool
                         result = await self._execute_tool(tool_name, tool_args, case)
-                        all_tool_results.append({"tool": tool_name, "result": result})
                         
-                        logger.info(f"    Tool result: {result.get('status', 'unknown')}")
+                        # Log detailed result
+                        result_status = result.get('status', 'unknown')
+                        result_data = result.get('data', {})
+                        
+                        logger.info(f"    │ Status: {result_status}")
+                        if tool_name == "get_plan":
+                            plan_steps = result_data.get('plan', [])
+                            logger.info(f"    │ PLANNER RESULT:")
+                            logger.info(f"    │   Routing: {result_data.get('routing', 'N/A')}")
+                            logger.info(f"    │   Steps: {len(plan_steps)}")
+                            for i, step in enumerate(plan_steps):
+                                step_type = step.get('step_type', 'UNKNOWN')
+                                if hasattr(step_type, 'value'):
+                                    step_type = step_type.value
+                                logger.info(f"    │     {i+1}. {step_type}: {step.get('description', '')[:60]}")
+                        elif tool_name == "get_warranty_record":
+                            logger.info(f"    │ WARRANTY RECORD RESULT:")
+                            logger.info(f"    │   Product: {result_data.get('product_name', 'N/A')}")
+                            logger.info(f"    │   Type: {result_data.get('product_type', 'N/A')}")
+                            ws = result_data.get('warranty_status', {})
+                            logger.info(f"    │   Warranty Active: {ws.get('active', 'N/A')}")
+                            logger.info(f"    │   Coverage: {ws.get('coverage_types', [])}")
+                            logger.info(f"    │   Expiry: {ws.get('expiration_date', 'N/A')}")
+                        elif tool_name == "run_calculation":
+                            logger.info(f"    │ CALCULATION RESULT:")
+                            logger.info(f"    │   Description: {result_data.get('description', 'N/A')}")
+                            logger.info(f"    │   Output: {result_data.get('output', 'N/A')}")
+                        elif tool_name == "get_service_directory":
+                            providers = result_data.get('providers', [])
+                            logger.info(f"    │ SERVICE DIRECTORY RESULT:")
+                            logger.info(f"    │   Providers found: {len(providers)}")
+                            for p in providers[:3]:
+                                logger.info(f"    │     - {p.get('name', 'N/A')} ({p.get('distance_miles', 'N/A')} mi)")
+                        elif tool_name == "check_territory":
+                            logger.info(f"    │ TERRITORY CHECK RESULT:")
+                            logger.info(f"    │   Serviceable: {result_data.get('serviceable', 'N/A')}")
+                            logger.info(f"    │   Region: {result_data.get('region', 'N/A')}")
+                        elif tool_name == "generate_paypal_link":
+                            logger.info(f"    │ PAYPAL LINK RESULT:")
+                            logger.info(f"    │   Payment URL: {result_data.get('payment_url', 'N/A')[:50]}...")
+                        elif tool_name == "route_to_queue":
+                            logger.info(f"    │ QUEUE ROUTING RESULT:")
+                            logger.info(f"    │   Queue: {result_data.get('queue', 'N/A')}")
+                            logger.info(f"    │   Case ID: {result_data.get('case_id', 'N/A')}")
+                        else:
+                            logger.info(f"    │ Result Data: {json.dumps(result_data, default=str)[:300]}")
+                        logger.info(f"    └{'─' * 40}")
+                        
+                        # Track for response
+                        all_tool_calls.append({
+                            "tool": tool_name,
+                            "args": tool_args,
+                            "status": result_status,
+                            "summary": self._summarize_tool_result(tool_name, result)
+                        })
                         
                         # Add tool result to messages
                         messages.append({
@@ -738,12 +868,17 @@ REMINDER: Use run_calculation tool for ANY math (days remaining, cost gaps, etc.
                 # No tool calls - LLM is done, return response
                 final_response = message.content or "I've processed your request. Is there anything else I can help you with?"
                 
-                logger.info(f"<<< LLM final response (first 200 chars): {final_response[:200]}")
+                logger.info("")
+                logger.info("=" * 70)
+                logger.info("<<< LLM FINAL RESPONSE")
+                logger.info("=" * 70)
+                logger.info(f"{final_response[:500]}")
+                logger.info("=" * 70)
                 
                 return {
                     "response": final_response,
                     "action": None,
-                    "tool_results": all_tool_results
+                    "tool_calls": all_tool_calls
                 }
                 
             except Exception as e:
@@ -918,3 +1053,42 @@ REMINDER: Use run_calculation tool for ANY math (days remaining, cost gaps, etc.
                 }
             }
         ]
+    
+    def _summarize_tool_result(self, tool_name: str, result: Dict[str, Any]) -> str:
+        """Create a brief summary of a tool result for logging."""
+        status = result.get("status", "unknown")
+        data = result.get("data", {})
+        
+        if status != "ok":
+            return f"Error: {result.get('message', 'Unknown error')}"
+        
+        if tool_name == "get_plan":
+            plan = data.get("plan", [])
+            routing = data.get("routing", "N/A")
+            return f"Plan with {len(plan)} steps, routing={routing}"
+        
+        elif tool_name == "get_warranty_record":
+            ws = data.get("warranty_status", {})
+            return f"Warranty active={ws.get('active', 'N/A')}, coverage={ws.get('coverage_types', [])}"
+        
+        elif tool_name == "run_calculation":
+            return f"Calculated: {data.get('output', 'N/A')}"
+        
+        elif tool_name == "get_service_directory":
+            providers = data.get("providers", [])
+            return f"Found {len(providers)} service providers"
+        
+        elif tool_name == "check_territory":
+            return f"Serviceable: {data.get('serviceable', 'N/A')}"
+        
+        elif tool_name == "generate_paypal_link":
+            return f"Payment link generated"
+        
+        elif tool_name == "route_to_queue":
+            return f"Routed to queue: {data.get('queue', 'N/A')}"
+        
+        elif tool_name == "calculate_charges":
+            summary = data.get("summary", {})
+            return f"Total charges: ${summary.get('total_potential_charges', 0)}"
+        
+        return f"Result: {status}"

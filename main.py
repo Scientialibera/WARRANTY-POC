@@ -4,13 +4,16 @@ Warranty POC - Main Entry Point
 This module provides the main entry point for running the warranty
 orchestrator POC. It auto-populates dummy data to test the blue box
 workflow (Orchestrator → Planner → Warranty Details MCP → Compute → Actions MCP).
+
+Uses OpenAI-style API format where caller manages conversation history
+as a messages array with role/content structure.
 """
 
 import asyncio
 import json
 import sys
 import logging
-from typing import Optional
+from typing import Optional, List
 
 from src.orchestrator import WarrantyOrchestrator
 
@@ -237,9 +240,25 @@ class POCRunner:
         customer_id: str,
         product_id: str,
         location_key: str,
-        case_id: Optional[str] = None
+        case_id: Optional[str] = None,
+        conversation_history: Optional[List[dict]] = None
     ) -> dict:
-        """Build a request with dummy data pre-populated."""
+        """
+        Build a request in OpenAI API style format.
+        
+        The caller manages the conversation history as a messages array.
+        
+        Args:
+            user_message: Current user message
+            customer_id: Customer ID from dummy data
+            product_id: Product ID from dummy data
+            location_key: Location key from dummy data
+            case_id: Optional case ID for continuing a case
+            conversation_history: Previous messages in [{"role": "...", "content": "..."}] format
+        
+        Returns:
+            Request dict in OpenAI-style format with messages array and context
+        """
         customer = DUMMY_CUSTOMERS[customer_id]
         product = DUMMY_PRODUCTS[product_id]
         location = DUMMY_LOCATIONS[location_key]
@@ -252,8 +271,12 @@ class POCRunner:
             "coverage_limits": product.get("coverage_limits", {})
         }
         
-        return {
-            "user_message": user_message,
+        # Build messages array - caller manages history
+        messages = conversation_history.copy() if conversation_history else []
+        messages.append({"role": "user", "content": user_message})
+        
+        # Build context object with all pre-populated data
+        context = {
             # Pre-populated - bypassing login/registration gates
             "logged_in": True,
             "has_registered_products": True,
@@ -275,6 +298,12 @@ class POCRunner:
             # Case continuation
             "case_id": case_id
         }
+        
+        # Return OpenAI-style request format
+        return {
+            "messages": messages,
+            "context": context
+        }
     
     async def run_scenario(self, scenario: dict) -> dict:
         """Run a single test scenario."""
@@ -292,35 +321,52 @@ class POCRunner:
         
         case_id = None
         results = []
+        conversation_history = []  # Track conversation for OpenAI-style API
         
         for i, message in enumerate(scenario['user_messages'], 1):
             print(f"\n>>> Turn {i}: User says: \"{message}\"")
             
+            # Build request with conversation history (caller manages messages)
             request = self.build_request(
                 user_message=message,
                 customer_id=scenario['customer'],
                 product_id=scenario['product'],
                 location_key=scenario['location'],
-                case_id=case_id
+                case_id=case_id,
+                conversation_history=conversation_history
             )
             
             result = await self.orchestrator.process_request(request)
             case_id = result.get("case_id")
             results.append(result)
             
+            # Update conversation history with user message and assistant response
+            conversation_history.append({"role": "user", "content": message})
+            if result.get("message"):
+                conversation_history.append(result["message"])
+            elif result.get("response"):
+                conversation_history.append({"role": "assistant", "content": result["response"]})
+            
             print(f"\n<<< Bot Response:")
             print(f"    Status: {result.get('status')}")
             print(f"    Case ID: {case_id}")
             
-            response = result.get('response', 'No response')
+            # Get response from OpenAI-style message format or fallback
+            response = result.get('message', {}).get('content') or result.get('response', 'No response')
             # Wrap long responses
-            wrapped = '\n    '.join([response[i:i+70] for i in range(0, len(response), 70)])
+            wrapped = '\n    '.join([response[j:j+70] for j in range(0, len(response), 70)])
             print(f"    Message: {wrapped}")
             
             if result.get('action'):
                 print(f"    Action: {result['action']}")
                 if result.get('action_data'):
                     print(f"    Action Data: {json.dumps(result['action_data'], indent=6)}")
+            
+            # Show tool calls summary
+            if result.get('tool_calls'):
+                print(f"\n    Tool Calls ({len(result['tool_calls'])}):")
+                for tc in result['tool_calls']:
+                    print(f"      - {tc['tool']}: {tc.get('summary', tc.get('status', 'N/A'))}")
         
         print(f"\n{'='*70}")
         print("SCENARIO COMPLETE")
@@ -331,7 +377,8 @@ class POCRunner:
             "case_id": case_id,
             "turns": len(scenario['user_messages']),
             "final_status": results[-1].get('status') if results else None,
-            "final_action": results[-1].get('action') if results else None
+            "final_action": results[-1].get('action') if results else None,
+            "conversation_history": conversation_history
         }
     
     async def run_all_scenarios(self):
