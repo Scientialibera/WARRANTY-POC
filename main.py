@@ -16,6 +16,7 @@ import logging
 from typing import Optional, List
 
 from src.orchestrator import WarrantyOrchestrator
+from src.utils.test_reporter import TestReporter, ScenarioResult, Turn, ToolCall
 
 # Configure logging
 logging.basicConfig(
@@ -223,6 +224,22 @@ TEST_SCENARIOS = [
             "Generate PayPal link",
             "Complete case"
         ]
+    },
+    {
+        "name": "Missing Product Information",
+        "description": "Customer doesn't provide product ID or name - LLM should ask for missing info.",
+        "customer": "CUST-001",
+        "product": None,
+        "location": "serviceable",
+        "user_messages": [
+            "I need help with my water heater",
+        ],
+        "expected_flow": [
+            "LLM identifies missing required fields (product_id, product_name)",
+            "Ask for missing information",
+            "Wait for customer to provide details",
+            "Complete missing info collection"
+        ]
     }
 ]
 
@@ -251,7 +268,7 @@ class POCRunner:
         Args:
             user_message: Current user message
             customer_id: Customer ID from dummy data
-            product_id: Product ID from dummy data
+            product_id: Product ID from dummy data (can be None)
             location_key: Location key from dummy data
             case_id: Optional case ID for continuing a case
             conversation_history: Previous messages in [{"role": "...", "content": "..."}] format
@@ -260,15 +277,15 @@ class POCRunner:
             Request dict in OpenAI-style format with messages array and context
         """
         customer = DUMMY_CUSTOMERS[customer_id]
-        product = DUMMY_PRODUCTS[product_id]
+        product = DUMMY_PRODUCTS[product_id] if product_id else None
         location = DUMMY_LOCATIONS[location_key]
         
         # Build warranty status from dummy data with full details
         warranty_status = {
-            "active": product["warranty_active"],
-            "coverage_types": product["coverage_types"],
-            "expiry_date": product.get("warranty_expiry_date"),
-            "coverage_limits": product.get("coverage_limits", {})
+            "active": product["warranty_active"] if product else False,
+            "coverage_types": product["coverage_types"] if product else [],
+            "expiry_date": product.get("warranty_expiry_date") if product else None,
+            "coverage_limits": product.get("coverage_limits", {}) if product else {}
         }
         
         # Build messages array - caller manages history
@@ -283,12 +300,12 @@ class POCRunner:
             # Customer info
             "customer_id": customer["customer_id"],
             "customer_name": customer["customer_name"],
-            # Product info
-            "product_id": product["product_id"],
-            "product_type": product["product_type"],
-            "product_name": product["product_name"],
-            "serial_number": product["serial_number"],
-            "purchase_date": product.get("purchase_date"),
+            # Product info (may be None if not provided)
+            "product_id": product["product_id"] if product else None,
+            "product_type": product["product_type"] if product else None,
+            "product_name": product["product_name"] if product else None,
+            "serial_number": product["serial_number"] if product else None,
+            "purchase_date": product.get("purchase_date") if product else None,
             # Warranty status from dummy data (with expiry and limits)
             "warranty_status": warranty_status,
             # Location
@@ -312,7 +329,10 @@ class POCRunner:
         print(f"{'='*70}")
         print(f"Description: {scenario['description']}")
         print(f"Customer: {scenario['customer']}")
-        print(f"Product: {scenario['product']} ({DUMMY_PRODUCTS[scenario['product']]['product_type']})")
+        product_info = f"{scenario['product']}" if scenario['product'] else "(None - Testing Missing Info)"
+        if scenario['product']:
+            product_info += f" ({DUMMY_PRODUCTS[scenario['product']]['product_type']})"
+        print(f"Product: {product_info}")
         print(f"Location: {scenario['location']}")
         print(f"\nExpected Flow:")
         for i, step in enumerate(scenario['expected_flow'], 1):
@@ -378,7 +398,8 @@ class POCRunner:
             "turns": len(scenario['user_messages']),
             "final_status": results[-1].get('status') if results else None,
             "final_action": results[-1].get('action') if results else None,
-            "conversation_history": conversation_history
+            "conversation_history": conversation_history,
+            "results": results  # Include full results with tool_calls
         }
     
     async def run_all_scenarios(self):
@@ -388,24 +409,72 @@ class POCRunner:
         print("=" * 70)
         print(f"\nTotal scenarios to run: {len(TEST_SCENARIOS)}")
         print("This tests the blue box workflow:")
-        print("  Orchestrator → Planner → Warranty Details MCP → Compute → Actions MCP")
+        print("  Orchestrator -> Planner -> Warranty Details MCP -> Compute -> Actions MCP")
         print("-" * 70)
         
         summary = []
+        reporter = TestReporter()
         
         for scenario in TEST_SCENARIOS:
             result = await self.run_scenario(scenario)
             summary.append(result)
+            
+            # Build scenario result for report
+            scenario_result = ScenarioResult(
+                scenario_name=scenario['name'],
+                description=scenario['description'],
+                customer_id=scenario['customer'],
+                product_id=scenario['product'],
+                location=scenario['location'],
+                turns=[],
+                status="PASS" if result['final_status'] == 'ok' else "FAIL",
+                case_id=result['case_id']
+            )
+            
+            # Extract turns from results with full tool call details
+            results_list = result.get('results', [])
+            
+            for turn_idx, turn_result in enumerate(results_list):
+                user_msg = scenario['user_messages'][turn_idx] if turn_idx < len(scenario['user_messages']) else ""
+                bot_response = turn_result.get('message', {}).get('content') or turn_result.get('response', '')
+                
+                # Build ToolCall objects with full details
+                tool_calls_data = []
+                for tc in turn_result.get('tool_calls', []):
+                    tool_call = ToolCall(
+                        tool_name=tc.get('tool', 'unknown'),
+                        arguments=tc.get('args', {}),
+                        status=tc.get('status', 'unknown'),
+                        result_summary=tc.get('summary', 'N/A'),
+                        result_data=tc.get('result_data')
+                    )
+                    tool_calls_data.append(tool_call)
+                
+                turn = Turn(
+                    turn_number=turn_idx + 1,
+                    user_message=user_msg,
+                    bot_response=bot_response,
+                    tool_calls=tool_calls_data,
+                    case_id=result['case_id']
+                )
+                scenario_result.turns.append(turn)
+            
+            reporter.add_scenario(scenario_result)
+        
+        # Generate report file
+        report_path = "test_report.txt"
+        reporter.generate_report(report_path)
         
         # Print summary
         print("\n" + "=" * 70)
         print("  SUMMARY")
         print("=" * 70)
         for s in summary:
-            status_icon = "✓" if s['final_status'] == 'ok' else "✗"
+            status_icon = "[PASS]" if s['final_status'] == 'ok' else "[FAIL]"
             print(f"  {status_icon} {s['scenario']}")
             print(f"      Case: {s['case_id']}, Turns: {s['turns']}, Action: {s['final_action']}")
-        print("=" * 70 + "\n")
+        print("=" * 70)
+        print(f"\nDetailed test report saved to: {report_path}\n")
     
     async def interactive_mode(self):
         """Run in interactive mode with pre-populated data."""

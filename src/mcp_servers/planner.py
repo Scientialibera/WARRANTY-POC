@@ -76,8 +76,18 @@ def generate_plan(context: dict, user_message: str) -> dict:
     This function implements the workflow logic and returns a plan
     that the orchestrator will execute step by step.
     
+    REQUIRED FIELDS for warranty processing:
+    - product_id or serial_number (to identify the product in warranty system)
+    - product_name (descriptive name, e.g., "heat pump water heater")
+    - location: zip code, city, and state (for territory and service routing)
+    
+    ASSUMPTIONS:
+    - Login and product registration are handled by frontend
+    - All requests come pre-authenticated with context
+    - We adaptively collect missing required fields before proceeding
+    
     Args:
-        context: Current case context
+        context: Current case context (pre-authenticated)
         user_message: The user's latest message
         
     Returns:
@@ -86,9 +96,8 @@ def generate_plan(context: dict, user_message: str) -> dict:
     steps: list[PlanStep] = []
     
     # Extract context values with defaults
-    logged_in = context.get("logged_in", False)
-    has_registered_products = context.get("has_registered_products", False)
     product_id = context.get("product_id") or context.get("serial_number")
+    product_name = context.get("product_name")
     location = context.get("location", {})
     product_type = context.get("product_type")
     warranty_status = context.get("warranty_status", {})
@@ -98,30 +107,12 @@ def generate_plan(context: dict, user_message: str) -> dict:
     # Check for location completeness
     has_location = bool(location.get("zip") or (location.get("city") and location.get("state")))
     
-    # STEP 1: Login Gate
-    if not logged_in:
-        steps.append(PlanStep(
-            step_type=StepType.RETURN_ACTION,
-            description="User must be logged in to proceed with warranty service",
-            action_type=ActionType.PROMPT_LOGIN,
-            message="Please log in to access warranty services. You can ask simple questions without logging in, but warranty claims require authentication."
-        ))
-        return _build_response(steps, "User not logged in - prompting for login")
-    
-    # STEP 2: Registration Gate
-    if not has_registered_products:
-        steps.append(PlanStep(
-            step_type=StepType.RETURN_ACTION,
-            description="User must have registered products to proceed",
-            action_type=ActionType.PROMPT_PRODUCT_REGISTRATION,
-            message="You don't have any registered products. Please register your product to access warranty services."
-        ))
-        return _build_response(steps, "No registered products - prompting for registration")
-    
-    # STEP 3: Collect Required Info
+    # STEP 1: Collect Missing Required Information
     missing_fields = []
     if not product_id:
-        missing_fields.append("product_id")
+        missing_fields.append("product ID or serial number")
+    if not product_name:
+        missing_fields.append("product name (e.g., 'heat pump water heater', 'water softener')")
     if not has_location:
         missing_fields.append("location (zip code or city/state)")
     
@@ -130,11 +121,11 @@ def generate_plan(context: dict, user_message: str) -> dict:
             step_type=StepType.ASK_USER_FOR_INFO,
             description="Collect missing information required for warranty processing",
             required_fields=missing_fields,
-            message=f"To help you with your warranty request, I need the following information: {', '.join(missing_fields)}"
+            message=f"To help you better, I need a few details: {', '.join(missing_fields)}. Please provide these so I can look up your warranty information."
         ))
         return _build_response(steps, f"Missing required fields: {missing_fields}")
     
-    # STEP 4: Determine Warranty + Product Type (if not already done)
+    # STEP 2: Determine Warranty + Product Type (if not already done)
     if not product_type or not warranty_status.get("active") is not None:
         steps.append(PlanStep(
             step_type=StepType.CALL_TOOL,

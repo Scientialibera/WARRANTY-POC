@@ -847,12 +847,13 @@ REMINDER: Use run_calculation tool for ANY math (days remaining, cost gaps, etc.
                             logger.info(f"    │ Result Data: {json.dumps(result_data, default=str)[:300]}")
                         logger.info(f"    └{'─' * 40}")
                         
-                        # Track for response
+                        # Track for response - include full result data for reporting
                         all_tool_calls.append({
                             "tool": tool_name,
                             "args": tool_args,
                             "status": result_status,
-                            "summary": self._summarize_tool_result(tool_name, result)
+                            "summary": self._summarize_tool_result(tool_name, result),
+                            "result_data": result_data  # Full result data for detailed reporting
                         })
                         
                         # Add tool result to messages
@@ -890,169 +891,49 @@ REMINDER: Use run_calculation tool for ANY math (days remaining, cost gaps, etc.
         return await self._execute_workflow(case, user_message)
     
     def _get_tool_definitions(self) -> List[Dict[str, Any]]:
-        """Get tool definitions for the LLM."""
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_plan",
-                    "description": "MUST BE CALLED FIRST. Get an execution plan from the Planner MCP. Returns a structured plan with workflow steps based on the current case context.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "user_message": {
-                                "type": "string",
-                                "description": "The user's current message/request"
-                            }
+        """Load tool definitions from config/tools/*.json files."""
+        import glob
+        
+        tools = []
+        tools_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "config", "tools")
+        
+        # Load all JSON files from config/tools/
+        json_files = glob.glob(os.path.join(tools_dir, "*.json"))
+        
+        for json_file in json_files:
+            try:
+                with open(json_file, 'r') as f:
+                    tool_def = json.load(f)
+                    tools.append(tool_def)
+                    logger.debug(f"Loaded tool definition: {tool_def.get('function', {}).get('name', 'unknown')} from {json_file}")
+            except Exception as e:
+                logger.warning(f"Failed to load tool definition from {json_file}: {e}")
+        
+        # Add the run_calculation tool (code interpreter - not from MCP)
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "run_calculation",
+                "description": "Execute Python code for complex calculations. Use this for ANY math operations including: warranty days remaining, cost differences, coverage gap calculations, date arithmetic, percentage calculations, etc. The orchestrator should NEVER do math directly - always use this tool.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "description": "Python code to execute. Must print() the final result. Has access to datetime module."
                         },
-                        "required": ["user_message"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_warranty_record",
-                    "description": "MUST BE CALLED SECOND (after get_plan). Fetch warranty record from Warranty Docs MCP. Returns product_type, warranty_status, coverage_types, expiration_date, and coverage_limits.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "product_id": {"type": "string"},
-                            "serial_number": {"type": "string"}
+                        "description": {
+                            "type": "string",
+                            "description": "Brief description of what calculation is being performed"
                         }
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "calculate_charges",
-                    "description": "Calculate potential service charges",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "product_id": {"type": "string"},
-                            "product_type": {"type": "string"},
-                            "warranty_status": {"type": "object"},
-                            "location": {"type": "object"}
-                        },
-                        "required": ["product_id", "product_type", "warranty_status", "location"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "check_territory",
-                    "description": "Check if location is serviceable",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "location": {"type": "object"}
-                        },
-                        "required": ["location"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "route_to_queue",
-                    "description": "Route case to service queue",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "queue": {"type": "string"},
-                            "case_context": {"type": "object"},
-                            "priority": {"type": "string"}
-                        },
-                        "required": ["queue", "case_context"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_service_directory",
-                    "description": "Get list of service providers",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "product_type": {"type": "string"},
-                            "location": {"type": "object"}
-                        },
-                        "required": ["product_type", "location"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "generate_paypal_link",
-                    "description": "Generate PayPal payment link",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "amount": {"type": "number"},
-                            "metadata": {"type": "object"}
-                        },
-                        "required": ["amount", "metadata"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "log_decline_reason",
-                    "description": "Log reason for customer declining service",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "reason": {"type": "string"},
-                            "context": {"type": "object"}
-                        },
-                        "required": ["reason", "context"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "notify_next_steps",
-                    "description": "Send notification to customer",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "channel": {"type": "string"},
-                            "template_id": {"type": "string"},
-                            "context": {"type": "object"}
-                        },
-                        "required": ["channel", "template_id", "context"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "run_calculation",
-                    "description": "Execute Python code for complex calculations. Use this for ANY math operations including: warranty days remaining, cost differences, coverage gap calculations, date arithmetic, percentage calculations, etc. The orchestrator should NEVER do math directly - always use this tool.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "code": {
-                                "type": "string",
-                                "description": "Python code to execute. Must print() the final result. Has access to datetime module."
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "Brief description of what calculation is being performed"
-                            }
-                        },
-                        "required": ["code", "description"]
-                    }
+                    },
+                    "required": ["code", "description"]
                 }
             }
-        ]
+        })
+        
+        logger.info(f"Loaded {len(tools)} tool definitions from {tools_dir}")
+        return tools
     
     def _summarize_tool_result(self, tool_name: str, result: Dict[str, Any]) -> str:
         """Create a brief summary of a tool result for logging."""
