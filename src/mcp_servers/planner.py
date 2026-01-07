@@ -229,18 +229,19 @@ def _generate_heat_plan(
     """
     Generate plan for HEAT product path.
     
-    STRICT ORDER:
-    1. Calculate charges (MUST happen before asking to proceed)
-    2. Ask user to proceed
-    3. If declined: log reason
-    4. If proceed: territory check
-    5. If serviceable: PayPal link
-    6. If not serviceable: service directory
+    STRICT ORDER (MULTI-TURN):
+    Turn 1: Calculate charges → Present charges → END TURN (wait for user confirmation)
+    Turn 2: User confirms (yes/no)
+        - If YES: territory check → PayPal link OR service directory
+        - If NO: log decline reason → end
+    
+    IMPORTANT: After presenting charges, we MUST end the turn and wait for user input.
+    The next turn will process their yes/no response.
     """
     location = context.get("location", {})
     product_id = context.get("product_id")
     
-    # HEAT Step 1: Calculate charges (if not already done)
+    # HEAT Step 1: Calculate charges and ASK for confirmation (END TURN)
     if potential_charges is None:
         steps.append(PlanStep(
             step_type=StepType.CALL_TOOL,
@@ -253,37 +254,26 @@ def _generate_heat_plan(
                 "location": location
             }
         ))
+        # END TURN HERE - Ask for confirmation and wait
         steps.append(PlanStep(
-            step_type=StepType.RESPOND_TO_USER,
-            description="Present charges and ask for confirmation",
-            message="Based on your warranty coverage, here are the potential charges. Would you like to proceed?"
+            step_type=StepType.ASK_USER_FOR_INFO,
+            description="Present charges and ask for confirmation - END TURN",
+            required_fields=["proceed_confirmation"],
+            message="Based on your warranty coverage, here are the potential service charges. Would you like to proceed with the service? Please reply Yes or No."
         ))
-        return _build_response(steps, "HEAT path - calculating charges")
+        return _build_response(steps, "HEAT path - Turn 1: Calculated charges, asking for confirmation, END TURN")
     
-    # HEAT Step 2: Handle customer decision
-    if customer_decision is None or customer_decision == "PENDING":
-        # Check if user's message indicates a decision
-        user_lower = user_message.lower()
-        if any(word in user_lower for word in ["yes", "proceed", "continue", "ok", "sure", "agree"]):
-            # User wants to proceed
-            customer_decision = "PROCEED"
-        elif any(word in user_lower for word in ["no", "cancel", "stop", "decline", "don't", "dont"]):
-            # User is declining
-            customer_decision = "DECLINE"
-        else:
-            # Still waiting for decision
-            steps.append(PlanStep(
-                step_type=StepType.ASK_USER_FOR_INFO,
-                description="Ask customer to confirm proceeding with service",
-                required_fields=["proceed_confirmation"],
-                message=f"The estimated charge for service is ${potential_charges:.2f}. Would you like to proceed? (Please reply Yes or No. If No, please let me know the reason.)"
-            ))
-            return _build_response(steps, "HEAT path - awaiting customer decision")
+    # HEAT Step 2: We have charges, now check user's response from this turn
+    # The user_message in this turn should contain their yes/no answer
+    user_lower = user_message.lower()
     
-    # Handle DECLINE
-    if customer_decision == "DECLINE":
-        # Extract reason from user message if possible
-        reason = user_message if len(user_message) > 10 else "Customer declined without specific reason"
+    # Detect user's decision from their message
+    is_yes = any(word in user_lower for word in ["yes", "proceed", "continue", "ok", "sure", "agree", "go ahead", "let's do it"])
+    is_no = any(word in user_lower for word in ["no", "cancel", "stop", "decline", "don't", "dont", "expensive", "can't afford"])
+    
+    if is_no or customer_decision == "DECLINE":
+        # User is declining - log reason and end
+        reason = user_message if len(user_message) > 5 else "Customer declined service"
         
         steps.append(PlanStep(
             step_type=StepType.CALL_TOOL,
@@ -304,12 +294,36 @@ def _generate_heat_plan(
             description="Acknowledge decline and offer alternatives",
             message="I understand. I've noted your decision. If you change your mind or have any questions, please don't hesitate to reach out. Is there anything else I can help you with?"
         ))
-        return _build_response(steps, "HEAT path - customer declined, reason logged")
+        return _build_response(steps, "HEAT path - Turn 2: Customer declined, reason logged")
     
-    # HEAT Step 3: Territory check (customer decided to PROCEED)
+    elif is_yes or customer_decision == "PROCEED":
+        # User wants to proceed - continue with territory check
+        return _continue_heat_proceed_flow(steps, context, location, product_id, potential_charges)
+    
+    else:
+        # Unclear response - ask again
+        steps.append(PlanStep(
+            step_type=StepType.ASK_USER_FOR_INFO,
+            description="Clarify user's decision",
+            required_fields=["proceed_confirmation"],
+            message=f"I want to make sure I understand. The service charge would be ${potential_charges:.2f}. Would you like to proceed? Please reply Yes or No."
+        ))
+        return _build_response(steps, "HEAT path - Turn 2: Unclear response, asking for clarification")
+
+
+def _continue_heat_proceed_flow(
+    steps: list[PlanStep],
+    context: dict,
+    location: dict,
+    product_id: str,
+    potential_charges: float
+) -> dict:
+    """Continue HEAT flow after user confirms they want to proceed."""
+    
     territory_checked = context.get("territory_checked")
     territory_serviceable = context.get("territory_serviceable")
     
+    # Step 3: Territory check (if not already done)
     if territory_checked is None:
         steps.append(PlanStep(
             step_type=StepType.CALL_TOOL,
@@ -317,10 +331,11 @@ def _generate_heat_plan(
             tool_name="check_territory",
             tool_args={"location": location}
         ))
-        return _build_response(steps, "HEAT path - checking territory")
+        # For POC, we'll assume the tool returns and we can continue in same turn
+        # In production, this might be async
     
-    # HEAT Step 4: Handle based on territory result
-    if not territory_serviceable:
+    # Check territory result from context (set by previous tool call)
+    if territory_checked and not territory_serviceable:
         # Not serviceable - return service directory
         steps.append(PlanStep(
             step_type=StepType.CALL_TOOL,
@@ -333,9 +348,9 @@ def _generate_heat_plan(
             description="Inform customer about service options",
             message="Unfortunately, your location is outside our direct service territory. Here are authorized service providers in your area who can help:"
         ))
-        return _build_response(steps, "HEAT path - not serviceable, returning directory")
+        return _build_response(steps, "HEAT path - Customer agreed, but not serviceable territory")
     
-    # HEAT Step 5: Generate PayPal link (serviceable territory)
+    # Serviceable - Generate PayPal link
     steps.append(PlanStep(
         step_type=StepType.CALL_TOOL,
         description="Generate PayPal payment link for service charges",
@@ -354,7 +369,7 @@ def _generate_heat_plan(
         description="Provide payment link and next steps",
         message=f"Great! Please complete your payment of ${potential_charges:.2f} using the link below. Once payment is confirmed, we'll schedule your service appointment."
     ))
-    return _build_response(steps, "HEAT path - payment link generated")
+    return _build_response(steps, "HEAT path - Customer agreed, payment link generated")
 
 
 def _build_response(steps: list[PlanStep], reasoning: str) -> dict:

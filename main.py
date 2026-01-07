@@ -49,8 +49,14 @@ DUMMY_PRODUCTS = {
         "product_name": "ProLine XE Heat Pump Water Heater",
         "serial_number": "HPWH-2024-001234",
         "purchase_date": "2024-06-15",
+        "warranty_expiry_date": "2027-06-15",  # 3-year warranty
         "warranty_active": True,
-        "coverage_types": ["parts", "labor", "controller"]
+        "coverage_types": ["parts", "labor", "controller"],
+        "coverage_limits": {
+            "parts": {"max_amount": 500.00, "used_amount": 0.00},
+            "labor": {"max_amount": 300.00, "used_amount": 0.00},
+            "controller": {"max_amount": 200.00, "used_amount": 0.00}
+        }
     },
     "HEAT-002": {
         "product_id": "HEAT-002",
@@ -58,8 +64,10 @@ DUMMY_PRODUCTS = {
         "product_name": "Voltex Hybrid Electric Heat Pump",
         "serial_number": "HPWH-2023-005678",
         "purchase_date": "2023-01-10",
-        "warranty_active": False,  # Warranty expired
-        "coverage_types": []
+        "warranty_expiry_date": "2025-01-10",  # Expired
+        "warranty_active": False,
+        "coverage_types": [],
+        "coverage_limits": {}
     },
     "SALT-001": {
         "product_id": "SALT-001",
@@ -67,8 +75,13 @@ DUMMY_PRODUCTS = {
         "product_name": "Water Softener Pro 5600",
         "serial_number": "WS-2024-001234",
         "purchase_date": "2024-08-20",
+        "warranty_expiry_date": "2026-08-20",  # 2-year warranty
         "warranty_active": True,
-        "coverage_types": ["parts", "labor"]
+        "coverage_types": ["parts", "labor"],
+        "coverage_limits": {
+            "parts": {"max_amount": 400.00, "used_amount": 50.00},
+            "labor": {"max_amount": 250.00, "used_amount": 0.00}
+        }
     },
     "SALT-002": {
         "product_id": "SALT-002",
@@ -76,8 +89,10 @@ DUMMY_PRODUCTS = {
         "product_name": "EcoWater Systems Refiner",
         "serial_number": "WS-2022-009876",
         "purchase_date": "2022-03-15",
-        "warranty_active": False,  # Warranty expired
-        "coverage_types": []
+        "warranty_expiry_date": "2024-03-15",  # Expired
+        "warranty_active": False,
+        "coverage_types": [],
+        "coverage_limits": {}
     }
 }
 
@@ -229,6 +244,14 @@ class POCRunner:
         product = DUMMY_PRODUCTS[product_id]
         location = DUMMY_LOCATIONS[location_key]
         
+        # Build warranty status from dummy data with full details
+        warranty_status = {
+            "active": product["warranty_active"],
+            "coverage_types": product["coverage_types"],
+            "expiry_date": product.get("warranty_expiry_date"),
+            "coverage_limits": product.get("coverage_limits", {})
+        }
+        
         return {
             "user_message": user_message,
             # Pre-populated - bypassing login/registration gates
@@ -242,6 +265,9 @@ class POCRunner:
             "product_type": product["product_type"],
             "product_name": product["product_name"],
             "serial_number": product["serial_number"],
+            "purchase_date": product.get("purchase_date"),
+            # Warranty status from dummy data (with expiry and limits)
+            "warranty_status": warranty_status,
             # Location
             "location": location,
             # Channel
@@ -342,8 +368,8 @@ class POCRunner:
         print("\nThis mode pre-populates dummy data so you can focus on testing the workflow.")
         print("\nAvailable Products:")
         for pid, prod in DUMMY_PRODUCTS.items():
-            warranty = "✓ WARRANTY" if prod['warranty_active'] else "✗ NO WARRANTY"
-            print(f"  {pid}: {prod['product_name']} ({prod['product_type']}) [{warranty}]")
+            warranty = "[WARRANTY]" if prod['warranty_active'] else "[NO WARRANTY]"
+            print(f"  {pid}: {prod['product_name']} ({prod['product_type']}) {warranty}")
         
         print("\nCommands:")
         print("  /product <id>  - Switch product (e.g., /product HEAT-002)")
@@ -452,19 +478,8 @@ async def main():
     """Main entry point."""
     runner = POCRunner()
     
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "--scenarios":
-            await runner.run_all_scenarios()
-        elif sys.argv[1] == "--help":
-            print("Usage:")
-            print("  python main.py              - Interactive mode with dummy data")
-            print("  python main.py --scenarios  - Run all test scenarios")
-            print("  python main.py --help       - Show this help")
-        else:
-            print(f"Unknown argument: {sys.argv[1]}")
-            print("Use --help for usage information")
-    else:
-        await runner.interactive_mode()
+    # Always run all test scenarios automatically
+    await runner.run_all_scenarios()
 
 
 if __name__ == "__main__":

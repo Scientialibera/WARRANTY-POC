@@ -156,11 +156,27 @@ class CaseContext(BaseModel):
             "product_id": "...",
             "serial_number": "...",
             "location": {"zip": "...", "city": "...", "state": "..."},
+            "warranty_status": {
+                "active": true/false, 
+                "coverage_types": [...],
+                "expiry_date": "YYYY-MM-DD",
+                "coverage_limits": {"parts": {"max_amount": X, "used_amount": Y}, ...}
+            },
+            "purchase_date": "YYYY-MM-DD",
             "channel": "chat"
         }
         """
         location_data = request.get("location", {})
         location = Location(**location_data) if location_data else Location()
+        
+        # Build warranty status with expiry and limits
+        warranty_data = request.get("warranty_status", {})
+        warranty_status = WarrantyStatus(
+            active=warranty_data.get("active", False),
+            coverage_types=warranty_data.get("coverage_types", []),
+            expiration_date=warranty_data.get("expiry_date"),
+            all_coverage=warranty_data.get("coverage_limits", {})
+        )
         
         return cls(
             logged_in=request.get("logged_in", False),
@@ -170,6 +186,10 @@ class CaseContext(BaseModel):
             customer_email=request.get("customer_email"),
             product_id=request.get("product_id"),
             serial_number=request.get("serial_number"),
+            product_type=request.get("product_type"),
+            product_name=request.get("product_name"),
+            purchase_date=request.get("purchase_date"),
+            warranty_status=warranty_status,
             location=location,
             channel=request.get("channel", "chat"),
             issue_description=request.get("issue_description")

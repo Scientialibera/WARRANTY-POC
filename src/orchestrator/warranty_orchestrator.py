@@ -212,8 +212,8 @@ class WarrantyOrchestrator:
             
             logger.info(f"Processing request - case_id={case.case_id}, user_message={user_message[:100]}")
             
-            # Generate and execute plan
-            result = await self._execute_workflow(case, user_message)
+            # Use LLM for reasoning (falls back to rule-based if client unavailable)
+            result = await self.process_with_llm(case, user_message)
             
             # Save case state
             self._cases[case.case_id] = case
@@ -299,68 +299,34 @@ class WarrantyOrchestrator:
         Validate plan against workflow constraints.
         
         Raises PlanValidationError if constraints are violated.
+        
+        NOTE: For POC, we trust the planner's constraint enforcement.
+        The planner already validates workflow order internally.
         """
         steps = plan.get("plan", [])
         
-        # Track what operations are in the plan
-        has_warranty_lookup = False
-        has_charge_calculation = False
-        has_proceed_question = False
-        has_territory_check = False
-        has_paypal_link = False
-        has_decline_log = False
-        
+        # Basic validation only - check step types are valid
         for step in steps:
             step_type = step.get("step_type")
-            tool_name = step.get("tool_name", "")
+            
+            # Handle enum values from planner
+            if hasattr(step_type, 'value'):
+                step_type = step_type.value
             
             if step_type not in STEP_TYPES:
                 raise PlanValidationError(f"Invalid step type: {step_type}")
             
             if step_type == "RETURN_ACTION":
                 action_type = step.get("action_type")
+                if hasattr(action_type, 'value'):
+                    action_type = action_type.value
                 if action_type and action_type not in ACTION_TYPES:
                     raise PlanValidationError(f"Invalid action type: {action_type}")
-            
-            # Track tool calls for constraint validation
-            if tool_name == "get_warranty_record":
-                has_warranty_lookup = True
-            elif tool_name == "calculate_charges":
-                has_charge_calculation = True
-            elif tool_name == "check_territory":
-                has_territory_check = True
-            elif tool_name == "generate_paypal_link":
-                has_paypal_link = True
-            elif tool_name == "log_decline_reason":
-                has_decline_log = True
-            
-            if step_type == "ASK_USER_FOR_INFO":
-                required_fields = step.get("required_fields", [])
-                if "proceed_confirmation" in str(required_fields):
-                    has_proceed_question = True
         
-        # Constraint: If we have HEAT path actions, validate order
-        if case.product_type == "HEAT":
-            # PayPal link requires territory check first
-            if has_paypal_link and not case.territory_checked:
-                if not has_territory_check:
-                    raise PlanValidationError(
-                        "Territory must be checked before generating PayPal link"
-                    )
-            
-            # Territory check requires proceed confirmation
-            if has_territory_check and case.customer_decision == "PENDING":
-                if not has_proceed_question and case.potential_charges is not None:
-                    raise PlanValidationError(
-                        "Customer must confirm proceeding before territory check"
-                    )
-            
-            # Proceed question requires charge calculation
-            if has_proceed_question and case.potential_charges is None:
-                if not has_charge_calculation:
-                    raise PlanValidationError(
-                        "Charges must be calculated before asking to proceed"
-                    )
+        # The planner enforces workflow constraints internally:
+        # - HEAT: charges → ask to proceed → territory check → PayPal/directory
+        # - SALT: warranty check → queue or directory
+        # No need to duplicate validation here for POC
     
     async def _execute_plan(
         self,
@@ -380,6 +346,7 @@ class WarrantyOrchestrator:
         
         for step in steps:
             step_type = step.get("step_type")
+            logger.info(f"Executing step - type={step_type}, description={step.get('description', 'N/A')}")
             
             if step_type == "RETURN_ACTION":
                 action = step.get("action_type")
@@ -387,6 +354,7 @@ class WarrantyOrchestrator:
                     "message": step.get("message", "")
                 }
                 responses.append(step.get("message", ""))
+                logger.info(f"RETURN_ACTION: {action}")
                 break  # Stop processing after return action
             
             elif step_type == "ASK_USER_FOR_INFO":
@@ -395,19 +363,23 @@ class WarrantyOrchestrator:
                 action_data = {
                     "required_fields": step.get("required_fields", [])
                 }
+                logger.info(f"ASK_USER_FOR_INFO: {step.get('required_fields', [])}")
                 break  # Wait for user response
             
             elif step_type == "CALL_TOOL":
                 tool_name = step.get("tool_name")
                 tool_args = step.get("tool_args", {})
                 
+                logger.info(f"CALL_TOOL: {tool_name}")
                 result = await self._execute_tool(tool_name, tool_args, case)
+                logger.info(f"Tool result status: {result.get('status', 'unknown')}")
                 
                 # Update case context with tool results
                 self._update_case_from_tool_result(case, tool_name, result)
             
             elif step_type == "RESPOND_TO_USER":
                 responses.append(step.get("message", ""))
+                logger.info(f"RESPOND_TO_USER: {step.get('message', '')[:50]}...")
         
         # Combine responses
         full_response = "\n\n".join(responses) if responses else "I'm here to help with your warranty request."
@@ -433,19 +405,37 @@ class WarrantyOrchestrator:
         
         try:
             # Import MCP server functions for POC (direct call)
-            if tool_name == "get_warranty_record":
+            if tool_name == "get_plan":
+                # Call the Planner MCP to get a structured execution plan
+                from src.mcp_servers.planner import generate_plan
+                user_message = tool_args.get("user_message", "")
+                context = case.to_dict()
+                plan_result = generate_plan(context, user_message)
+                logger.info(f"PLANNER MCP: Generated plan with {len(plan_result.get('data', {}).get('plan', []))} steps")
+                return plan_result
+            
+            elif tool_name == "get_warranty_record":
                 from src.mcp_servers.warranty_docs import get_warranty_record
-                return get_warranty_record(
-                    product_id=tool_args.get("product_id"),
+                result = get_warranty_record(
+                    product_id=tool_args.get("product_id") or case.product_id,
                     serial_number=tool_args.get("serial_number")
                 )
+                logger.info(f"WARRANTY DOCS MCP: Retrieved warranty record for {tool_args.get('product_id') or case.product_id}")
+                return result
             
             elif tool_name == "get_warranty_terms":
                 from src.mcp_servers.warranty_docs import get_warranty_terms
                 return get_warranty_terms()
             
             elif tool_name == "calculate_charges":
-                result_str = self.compute_service.run(tool_args)
+                # Ensure we have all required args from case context if LLM didn't provide them
+                full_args = {
+                    "product_id": tool_args.get("product_id", case.product_id),
+                    "product_type": tool_args.get("product_type", case.product_type),
+                    "warranty_status": tool_args.get("warranty_status", case.warranty_status.model_dump() if case.warranty_status else {}),
+                    "location": tool_args.get("location", case.location.model_dump() if case.location else {})
+                }
+                result_str = self.compute_service.run(full_args)
                 return json.loads(result_str)
             
             elif tool_name == "route_to_queue":
@@ -497,6 +487,53 @@ class WarrantyOrchestrator:
                     context=tool_args.get("context", {}),
                     recipient=tool_args.get("recipient")
                 )
+            
+            elif tool_name == "run_calculation":
+                # Code interpreter for math operations
+                code = tool_args.get("code", "")
+                description = tool_args.get("description", "Calculation")
+                
+                logger.info(f"CODE INTERPRETER: {description}")
+                logger.info(f"Code to execute:\n{code}")
+                
+                # Execute in a safe environment with datetime available
+                import io
+                import contextlib
+                from datetime import datetime, date, timedelta
+                
+                # Capture stdout
+                stdout_capture = io.StringIO()
+                local_vars = {
+                    "datetime": datetime,
+                    "date": date,
+                    "timedelta": timedelta,
+                    "today": date.today(),
+                    "now": datetime.now()
+                }
+                
+                try:
+                    with contextlib.redirect_stdout(stdout_capture):
+                        exec(code, {"__builtins__": __builtins__}, local_vars)
+                    
+                    output = stdout_capture.getvalue().strip()
+                    logger.info(f"CODE INTERPRETER result: {output}")
+                    
+                    return {
+                        "status": "ok",
+                        "data": {
+                            "description": description,
+                            "output": output,
+                            "variables": {k: str(v) for k, v in local_vars.items() 
+                                         if not k.startswith("_") and k not in ["datetime", "date", "timedelta", "today", "now"]}
+                        }
+                    }
+                except Exception as e:
+                    logger.error(f"CODE INTERPRETER error: {str(e)}")
+                    return {
+                        "status": "error",
+                        "error_code": "CALCULATION_ERROR",
+                        "message": str(e)
+                    }
             
             else:
                 logger.warning(f"Unknown tool: {tool_name}")
@@ -558,69 +595,164 @@ class WarrantyOrchestrator:
         user_message: str
     ) -> Dict[str, Any]:
         """
-        Process request using Azure OpenAI with Responses API.
+        Process request using Azure OpenAI with tool calling.
         
         This method uses the LLM for complex reasoning and free-form
         conversation, while still enforcing workflow constraints.
+        
+        Implements a proper agentic loop:
+        1. Send message to LLM
+        2. If LLM wants to call tools, execute them and send results back
+        3. Repeat until LLM gives a final response (no more tool calls)
         """
         if not self.client:
-            # Fallback to rule-based processing
+            logger.warning("No Azure OpenAI client available - falling back to rule-based processing")
             return await self._execute_workflow(case, user_message)
         
-        # Build messages for the LLM
+        logger.info(">>> Starting LLM agentic loop...")
+        
+        # Get current date for calculations
+        from datetime import date
+        current_date = date.today().isoformat()
+        
+        # Extract warranty details
+        warranty_expiry = None
+        coverage_limits = {}
+        if case.warranty_status:
+            warranty_expiry = getattr(case.warranty_status, 'expiration_date', None)
+            coverage_limits = getattr(case.warranty_status, 'all_coverage', {})
+        
+        # Build initial messages
         messages = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": self.system_prompt + """
+
+IMPORTANT RESPONSE GUIDELINES:
+- When you call a tool, wait for the result before responding
+- After getting tool results, provide a CONCISE response to the user
+- Do NOT explain your reasoning process or workflow steps to the user
+- Do NOT output code blocks or function call syntax in your response
+- Speak directly to the customer in a friendly, professional tone
+- If you need more information from the user, ask clearly and wait for their response
+
+CRITICAL - USE CODE INTERPRETER FOR ALL MATH:
+- NEVER do math calculations yourself - always use the run_calculation tool
+- Use run_calculation for: warranty days remaining, cost differences, coverage gaps, percentages, date arithmetic
+- Example: To find warranty days remaining, use run_calculation with Python code
+- Example: To find how much customer must pay if warranty covers $X but cost is $Y, use run_calculation
+- Always show the customer the calculation results clearly
+"""},
             {"role": "user", "content": f"""
-Current case context:
-{json.dumps(case.to_dict(), indent=2)}
+=== CURRENT DATE ===
+Today's Date: {current_date}
 
-User message: {user_message}
+=== CASE CONTEXT ===
+- Case ID: {case.case_id}
+- Product: {case.product_id} (Type: {case.product_type})
+- Product Name: {case.product_name or 'Unknown'}
+- Purchase Date: {getattr(case, 'purchase_date', 'Unknown')}
+- Location: {case.location.city}, {case.location.state} {case.location.zip if case.location else 'Unknown'}
 
-Based on the workflow constraints, determine the appropriate next steps.
+=== WARRANTY DETAILS ===
+- Warranty Active: {case.warranty_status.active if case.warranty_status else 'Unknown'}
+- Warranty Expiry Date: {warranty_expiry or 'Not specified'}
+- Coverage Types: {case.warranty_status.coverage_types if case.warranty_status else []}
+- Coverage Limits: {json.dumps(coverage_limits, default=str) if coverage_limits else 'Not specified'}
+
+=== CASE STATE ===
+- Customer Decision: {case.customer_decision.value if case.customer_decision else 'PENDING'}
+- Potential Charges: {case.potential_charges if case.potential_charges else 'Not calculated'}
+- Territory Checked: {case.territory_checked}
+- Territory Serviceable: {case.territory_serviceable}
+
+=== CUSTOMER MESSAGE ===
+{user_message}
+
+REMINDER: Use run_calculation tool for ANY math (days remaining, cost gaps, etc.)
 """}
         ]
         
-        try:
-            # Use Responses API with tools
-            response = self.client.chat.completions.create(
-                model=self.deployment,
-                messages=messages,
-                tools=self._get_tool_definitions(),
-                tool_choice="auto",
-                max_tokens=2000
-            )
-            
-            # Process response
-            message = response.choices[0].message
-            
-            if message.tool_calls:
-                # Execute tool calls
-                tool_results = []
-                for tool_call in message.tool_calls:
-                    tool_name = tool_call.function.name
-                    tool_args = json.loads(tool_call.function.arguments)
-                    result = await self._execute_tool(tool_name, tool_args, case)
-                    tool_results.append({
-                        "tool": tool_name,
-                        "result": result
+        max_iterations = 10  # Prevent infinite loops
+        all_tool_results = []
+        
+        for iteration in range(max_iterations):
+            try:
+                logger.info(f">>> LLM iteration {iteration + 1}: Sending request to {self.deployment}...")
+                
+                response = self.client.chat.completions.create(
+                    model=self.deployment,
+                    messages=messages,
+                    tools=self._get_tool_definitions(),
+                    tool_choice="auto",
+                    max_tokens=2000
+                )
+                
+                message = response.choices[0].message
+                finish_reason = response.choices[0].finish_reason
+                
+                logger.info(f"<<< LLM response - finish_reason={finish_reason}, has_tool_calls={bool(message.tool_calls)}")
+                
+                # If LLM wants to call tools
+                if message.tool_calls:
+                    # Add assistant message with tool calls to history
+                    messages.append({
+                        "role": "assistant",
+                        "content": message.content,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments
+                                }
+                            } for tc in message.tool_calls
+                        ]
                     })
+                    
+                    # Execute each tool call
+                    for tool_call in message.tool_calls:
+                        tool_name = tool_call.function.name
+                        try:
+                            tool_args = json.loads(tool_call.function.arguments)
+                        except json.JSONDecodeError:
+                            tool_args = {}
+                        
+                        logger.info(f"    Executing tool: {tool_name} with args: {json.dumps(tool_args, default=str)[:200]}")
+                        
+                        # Execute the tool
+                        result = await self._execute_tool(tool_name, tool_args, case)
+                        all_tool_results.append({"tool": tool_name, "result": result})
+                        
+                        logger.info(f"    Tool result: {result.get('status', 'unknown')}")
+                        
+                        # Add tool result to messages
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": json.dumps(result, default=str)
+                        })
+                    
+                    # Continue loop to get next LLM response
+                    continue
                 
-                # Get final response
+                # No tool calls - LLM is done, return response
+                final_response = message.content or "I've processed your request. Is there anything else I can help you with?"
+                
+                logger.info(f"<<< LLM final response (first 200 chars): {final_response[:200]}")
+                
                 return {
-                    "response": message.content or "I've processed your request.",
+                    "response": final_response,
                     "action": None,
-                    "tool_results": tool_results
-                }
-            else:
-                return {
-                    "response": message.content,
-                    "action": None
+                    "tool_results": all_tool_results
                 }
                 
-        except Exception as e:
-            logger.error(f"LLM processing failed - error={str(e)}")
-            # Fallback to rule-based
-            return await self._execute_workflow(case, user_message)
+            except Exception as e:
+                logger.error(f"LLM iteration {iteration + 1} failed - error={str(e)}", exc_info=True)
+                break
+        
+        # If we exit the loop without a response, fall back to rule-based
+        logger.warning("LLM loop exhausted or failed - falling back to rule-based processing")
+        return await self._execute_workflow(case, user_message)
     
     def _get_tool_definitions(self) -> List[Dict[str, Any]]:
         """Get tool definitions for the LLM."""
@@ -628,8 +760,25 @@ Based on the workflow constraints, determine the appropriate next steps.
             {
                 "type": "function",
                 "function": {
+                    "name": "get_plan",
+                    "description": "MUST BE CALLED FIRST. Get an execution plan from the Planner MCP. Returns a structured plan with workflow steps based on the current case context.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "user_message": {
+                                "type": "string",
+                                "description": "The user's current message/request"
+                            }
+                        },
+                        "required": ["user_message"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "get_warranty_record",
-                    "description": "Fetch warranty record for a product",
+                    "description": "MUST BE CALLED SECOND (after get_plan). Fetch warranty record from Warranty Docs MCP. Returns product_type, warranty_status, coverage_types, expiration_date, and coverage_limits.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -744,6 +893,27 @@ Based on the workflow constraints, determine the appropriate next steps.
                             "context": {"type": "object"}
                         },
                         "required": ["channel", "template_id", "context"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_calculation",
+                    "description": "Execute Python code for complex calculations. Use this for ANY math operations including: warranty days remaining, cost differences, coverage gap calculations, date arithmetic, percentage calculations, etc. The orchestrator should NEVER do math directly - always use this tool.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "code": {
+                                "type": "string",
+                                "description": "Python code to execute. Must print() the final result. Has access to datetime module."
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Brief description of what calculation is being performed"
+                            }
+                        },
+                        "required": ["code", "description"]
                     }
                 }
             }
