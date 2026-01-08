@@ -1,0 +1,202 @@
+===========================================
+WARRANTY POC - DIRECT TEST CASES
+===========================================
+Copy-paste these into direct_test.py for testing
+Each section shows what to type at each step
+
+===========================================
+CASE 1: SALT - Active Warranty - All Info Provided
+===========================================
+Step 1:
+My product SN-SALT-2024-001234 is not working and I need a replacement!
+
+Expected: Should route to queue for SALT warranty service
+
+
+===========================================
+CASE 2: SALT - Active Warranty - No ZIP Initially
+===========================================
+Step 1:
+My SALT system SN-SALT-2024-001234 stopped working
+
+Step 2:
+77005
+
+Expected: Should ask for zip, then route to queue
+
+
+===========================================
+CASE 3: SALT - Expired Warranty - All Info
+===========================================
+Step 1:
+My product SN-SALT-2022-005678 in zip 77003 is not working, need another one!
+
+Expected: Should provide third-party service directory
+
+
+===========================================
+CASE 4: SALT - Expired Warranty - Multi-Turn
+===========================================
+Step 1:
+I have a water softener that's broken
+
+Step 2:
+SN-SALT-2022-005678
+
+Step 3:
+77007
+
+Expected: Should ask for serial, check warranty (expired), provide service directory
+
+
+===========================================
+CASE 5: HEAT - Active Warranty - Serviceable Territory
+===========================================
+Step 1:
+My heat pump water heater SN-HEAT-2025-001111 in 77001 is making weird noises
+
+Expected: Should check territory (serviceable), route to queue with service tech
+
+
+===========================================
+CASE 6: HEAT - Active Warranty - Outside Territory
+===========================================
+Step 1:
+My product SN-HEAT-2025-001111 is broken and I'm in zip code 90210
+
+Expected: Should check territory (not serviceable), decline and offer third-party providers
+
+
+===========================================
+CASE 7: HEAT - Expired Warranty - All Info
+===========================================
+Step 1:
+My heat pump SN-HEAT-2020-002222 in 77005 stopped heating water
+
+Expected: Should check warranty (expired), offer third-party service directory
+
+
+===========================================
+CASE 8: HEAT - Expired Warranty - Customer Wants PayPal
+===========================================
+Step 1:
+SN-HEAT-2020-002222 is broken in zip 77002
+
+Step 2:
+Can I pay for the repair through PayPal?
+
+Expected: Should recognize expired warranty, generate PayPal link for out-of-warranty service
+
+
+===========================================
+CASE 9: HEAT - No Serial Number Initially
+===========================================
+Step 1:
+My heat pump water heater stopped working
+
+Step 2:
+SN-HEAT-2025-001111
+
+Step 3:
+77005
+
+Expected: Should ask for serial, then zip, check warranty and territory, route to service
+
+
+===========================================
+CASE 10: SALT - Customer Declines Service
+===========================================
+Step 1:
+My SALT system SN-SALT-2022-005678 in 77003 is broken
+
+Step 2:
+No thanks, I'll fix it myself
+
+Expected: Should offer service directory, then log decline reason
+
+
+===========================================
+CASE 11: Invalid Serial Number
+===========================================
+Step 1:
+My product INVALID-123 is broken in 77005
+
+Expected: Should handle gracefully, likely ask for correct serial number or report not found
+
+
+===========================================
+CASE 12: HEAT - Wants To Know Coverage First
+===========================================
+Step 1:
+What's covered under warranty for SN-HEAT-2025-001111?
+
+Step 2:
+I'm in 77006 and the tank is leaking
+
+Expected: Should explain coverage (tank covered 120 months), then route to service
+
+
+===========================================
+CASE 13: SALT - Vague Problem Description
+===========================================
+Step 1:
+SN-SALT-2024-001234 has issues
+
+Step 2:
+It's making loud banging noises and the water tastes weird
+
+Expected: Should route to queue with detailed issue description
+
+
+===========================================
+CASE 14: HEAT - Urgent Priority
+===========================================
+Step 1:
+URGENT: SN-HEAT-2025-001111 in 77002 completely failed, no hot water for 3 days!
+
+Expected: Should recognize urgency, route with high priority
+
+
+===========================================
+CASE 15: Multiple Products Question
+===========================================
+Step 1:
+I have both SN-SALT-2024-001234 and SN-HEAT-2025-001111. Which one has longer warranty?
+
+Step 2:
+Okay, the HEAT one is broken, I'm in 77001
+
+Expected: Should compare warranties, then handle HEAT service request
+
+
+===========================================
+DATABASE REFERENCE
+===========================================
+
+SALT Products:
+- SN-SALT-2024-001234 (Active - purchased 2024-01-15)
+  Parts: 24 months, Labor: 12 months
+  
+- SN-SALT-2022-005678 (Expired - purchased 2022-03-20)
+  Parts: 24 months, Labor: 12 months
+
+HEAT Products:
+- SN-HEAT-2025-001111 (Active - purchased 2025-01-01)
+  Parts: 36 months, Labor: 12 months, Tank: 120 months
+  
+- SN-HEAT-2020-002222 (Expired - purchased 2020-06-10)
+  Parts: 36 months, Labor: 12 months, Tank: 120 months
+
+Serviceable ZIP Codes:
+77001, 77002, 77003, 77004, 77005, 77006, 77007, 77008, 77009, 77010
+
+===========================================
+TESTING TIPS
+===========================================
+1. Watch for planner being called only ONCE at the start
+2. Verify conversation history is maintained across turns
+3. Check that get_warranty_terms is called with serial_number parameter
+4. Ensure orchestrator doesn't hallucinate serial numbers
+5. Verify tool parameters are filled correctly
+6. Check that issue_description is captured for route_to_queue
+7. Test both happy paths and edge cases

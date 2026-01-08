@@ -23,23 +23,19 @@ dependencies = [
     "azure-core>=1.24.0",
     "openai>=1.0.0",
     "agent-framework>=1.0.0b251223",
-    "structlog>=23.1.0",
+    "fastmcp>=2.0.0",
     "pydantic>=2.0.0",
-    "pydantic-settings>=2.0.0",
-    "tenacity>=8.2.0",
-    "anyio>=4.0.0",
     "typing-extensions>=4.0.0",
-    "tomli>=2.0.0;python_version<'3.11'",
-    "mcp>=1.0.0",
-    "python-dateutil>=2.8.0",
+    "streamlit>=1.28.0",
+    "pyjwt[crypto]>=2.8.0",  # OAuth 2.1 token validation
+    "requests>=2.31.0",  # JWKS fetching
+    "fastapi>=0.104.0",  # MCP server auth middleware
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
-    "black>=23.0.0",
-    "ruff>=0.1.0",
 ]
 
 [build-system]
@@ -48,63 +44,21 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*", "config*"]
+include = ["src*"]
 
 # ==============================================================================
-# AGENT CONFIGURATION
+# MCP SERVER CONFIGURATION (HTTP/SSE)
 # ==============================================================================
 
-[tool.agent]
-system_prompt = "config/system_prompt.txt"
-log_level = "INFO"
-
-[tool.agent.azure_openai]
-endpoint = ""
-deployment = ""
-api_version = "2024-10-01-preview"
-
-[tool.agent.tools]
-config_dir = "config/tools"
-
-# ==============================================================================
-# MCP SERVER CONFIGURATION
-# ==============================================================================
-
-[[tool.agent.mcp]]
-name = "planner"
-type = "stdio"
-enabled = true
-command = "python"
-args = ["-m", "src.mcp_servers.planner"]
-
-[[tool.agent.mcp]]
-name = "warranty_docs"
-type = "stdio"
-enabled = true
-command = "python"
-args = ["-m", "src.mcp_servers.warranty_docs"]
-
-[[tool.agent.mcp]]
-name = "actions"
-type = "stdio"
-enabled = true
-command = "python"
-args = ["-m", "src.mcp_servers.actions"]
+[tool.mcp.servers]
+planner = { port = 8001, module = "src.servers.planner_server" }
+warranty = { port = 8002, module = "src.servers.warranty.main" }
+actions = { port = 8003, module = "src.servers.actions.main" }
 
 # ==============================================================================
 # DEVELOPMENT TOOLS
 # ==============================================================================
 
-[tool.black]
-line-length = 100
-target-version = ["py310", "py311", "py312"]
-
-[tool.ruff]
-line-length = 100
-select = ["E", "F", "I", "W"]
-ignore = ["E501"]
-
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-python_files = ["test_*.py"]
